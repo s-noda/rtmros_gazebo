@@ -14,6 +14,8 @@ GZ_REGISTER_MODEL_PLUGIN(IOBPlugin);
 IOBPlugin::IOBPlugin() : publish_joint_state(false),
                          publish_joint_state_step(0),
                          publish_joint_state_counter(0),
+                         publish_robot_state_step(5),
+                         publish_robot_state_counter(0),
                          use_synchronized_command(false),
                          use_velocity_feedback(false),
                          use_joint_effort(false) {
@@ -127,6 +129,18 @@ void IOBPlugin::Load(physics::ModelPtr _parent, sdf::ElementPtr _sdf) {
           = this->rosNode->advertise<sensor_msgs::JointState>(topic, 100, true);
         ROS_INFO("publish joint state");
         this->publish_joint_state = true;
+      }
+    }
+    { // read publish_robot_state from rosparam
+      std::string pname = this->controller_name + "/publish_robot_state";
+      if (this->rosNode->hasParam(pname)) {
+        this->publish_robot_state_counter = 0;
+        this->publish_robot_state_step = 1;
+        if (this->rosNode->hasParam(pname + "/step")) {
+          int stp;
+          this->rosNode->getParam(pname + "/step", stp);
+          this->publish_robot_state_step = stp;
+        }
       }
     }
     XmlRpc::XmlRpcValue param_val;
@@ -624,14 +638,137 @@ void IOBPlugin::PublishJointState() {
   this->pubJointStateQueue->push(jstate, this->pubJointState);
   this->publish_joint_state_counter = 0;
 }
+
+void IOBPlugin::GetForceSensors(double new_scale, double prv_scale) {
+  if ( this->robotState.sensors.size() != this->forceSensorNames.size() ){
+    this->robotState.sensors.resize(this->forceSensorNames.size());
+  }
+  for (unsigned int i = 0; i < this->forceSensorNames.size(); i++) {
+    forceSensorMap::iterator it = this->forceSensors.find(this->forceSensorNames[i]);
+    if(it != this->forceSensors.end()) {
+      physics::JointPtr jt = it->second.joint;
+      if (!!jt) {
+        physics::JointWrench wrench = jt->GetForceTorque(0u);
+        this->robotState.sensors[i].name = this->forceSensorNames[i];
+        this->robotState.sensors[i].frame_id = it->second.frame_id;
+        if (!!it->second.pose) {
+          // convert force
+	  math::Vector3 force_trans = it->second.pose->rot * wrench.body2Force;
+	  math::Vector3 torque_trans = it->second.pose->rot * wrench.body2Torque;
+	  // rotate force
+	  this->robotState.sensors[i].force.x = new_scale * force_trans.x + prv_scale * this->robotState.sensors[i].force.x;
+	  this->robotState.sensors[i].force.y = new_scale * force_trans.y + prv_scale * this->robotState.sensors[i].force.y;
+	  this->robotState.sensors[i].force.z = new_scale * force_trans.z + prv_scale * this->robotState.sensors[i].force.z;
+	  // rotate torque + additional torque
+	  torque_trans += it->second.pose->pos.Cross(force_trans);
+	  this->robotState.sensors[i].torque.x = new_scale * torque_trans.x + prv_scale * this->robotState.sensors[i].torque.x;
+	  this->robotState.sensors[i].torque.y = new_scale * torque_trans.y + prv_scale * this->robotState.sensors[i].torque.y;
+	  this->robotState.sensors[i].torque.z = new_scale * torque_trans.z + prv_scale * this->robotState.sensors[i].torque.z;
+	} else {
+	  this->robotState.sensors[i].force.x = new_scale * wrench.body2Force.x + prv_scale * this->robotState.sensors[i].force.x;
+	  this->robotState.sensors[i].force.y = new_scale * wrench.body2Force.y + prv_scale * this->robotState.sensors[i].force.y;
+	  this->robotState.sensors[i].force.z = new_scale * wrench.body2Force.z + prv_scale * this->robotState.sensors[i].force.z;
+	  this->robotState.sensors[i].torque.x = new_scale * wrench.body2Torque.x + prv_scale * this->robotState.sensors[i].torque.x;
+	  this->robotState.sensors[i].torque.y = new_scale * wrench.body2Torque.y + prv_scale * this->robotState.sensors[i].torque.y;
+	  this->robotState.sensors[i].torque.z = new_scale * wrench.body2Torque.z + prv_scale * this->robotState.sensors[i].torque.z;
+        }
+      }
+    }
+  }
+}
+
+void IOBPlugin::GetJointSensors(){
+  // joint states
+  for (unsigned int i = 0; i < this->joints.size(); ++i) {
+    this->robotState.position[i] = this->joints[i]->GetAngle(0).Radian();
+    this->robotState.velocity[i] = this->joints[i]->GetVelocity(0);
+    if (this->use_joint_effort) {
+      physics::JointPtr j = this->joints[i];
+      physics::JointWrench w = j->GetForceTorque(0u);
+      {
+        math::Vector3 a = j->GetLocalAxis(0u);
+        this->robotState.effort[i] = a.Dot(w.body1Torque);
+      }
+#if 0 // DEBUG
+      {
+        math::Vector3 a = j->GetGlobalAxis(0u);
+        math::Vector3 m = this->joints[i]->GetChild()->GetWorldPose().rot * w.body2Torque;
+        float ret = this->robotState.effort[i] = a.Dot(m);
+        ROS_INFO("f[%d]->%f,%f", i, this->robotState.effort[i], ret);
+      }
+#endif
+    } else {
+      if (this->use_velocity_feedback) {
+        this->robotState.effort[i] = this->joints[i]->GetForce(0);
+      }
+    }
+  }
+  //
+  {
+    boost::mutex::scoped_lock lock(this->mutex);
+    for (unsigned int i = 0; i < this->joints.size(); ++i) {
+      this->robotState.ref_position[i] = this->jointCommand.position[i];
+      this->robotState.ref_velocity[i] = this->jointCommand.velocity[i];
+    }
+  }
+}
+
+void IOBPlugin::GetImuSensors(){
+  if (this->imuSensorNames.size() != this->robotState.Imus.size()){
+    this->robotState.Imus.resize(this->imuSensorNames.size());
+  }
+  for (unsigned int i = 0; i < this->imuSensorNames.size(); i++) {
+    imuSensorMap::iterator it = this->imuSensors.find(this->imuSensorNames[i]);
+    ImuSensorPtr sp = it->second.sensor;
+    if(!!sp) {
+      this->robotState.Imus[i].name = this->imuSensorNames[i];
+      this->robotState.Imus[i].frame_id = it->second.frame_id;
+      math::Vector3 wLocal = sp->GetAngularVelocity();
+      math::Vector3 accel = sp->GetLinearAcceleration();
+      math::Quaternion imuRot = sp->GetOrientation();
+      this->robotState.Imus[i].angular_velocity.x = wLocal.x;
+      this->robotState.Imus[i].angular_velocity.y = wLocal.y;
+      this->robotState.Imus[i].angular_velocity.z = wLocal.z;
+      this->robotState.Imus[i].linear_acceleration.x = accel.x;
+      this->robotState.Imus[i].linear_acceleration.y = accel.y;
+      this->robotState.Imus[i].linear_acceleration.z = accel.z;
+      this->robotState.Imus[i].orientation.x = imuRot.x;
+      this->robotState.Imus[i].orientation.y = imuRot.y;
+      this->robotState.Imus[i].orientation.z = imuRot.z;
+      this->robotState.Imus[i].orientation.w = imuRot.w;
+    }
+  }
+}
+
+void IOBPlugin::PublishRobotState(const common::Time &_curTime) {
+  this->robotState.header.stamp = ros::Time(_curTime.sec, _curTime.nsec);
+  this->publish_robot_state_counter++;
+  // force sensors
+  if (this->publish_robot_state_counter == 1) {
+    this->GetForceSensors(1.0, 0.0);
+  } else {
+    this->GetForceSensors(1.0, 1.0);
+  }
+  // joint sensors
+  this->GetJointSensors();
+  // imu sensors
+  this->GetImuSensors();
+  // publish
+  if(this->publish_robot_state_step > this->publish_robot_state_counter) {
+    return;
+  }
+  this->GetForceSensors(0.0, 1.0/this->publish_robot_state_step);
+  this->publish_robot_state_counter = 0;
+  this->pubRobotStateQueue->push(this->robotState, this->pubRobotState);
+}
+
+
 void IOBPlugin::UpdateStates() {
   //ROS_DEBUG("update");
   common::Time curTime = this->world->GetSimTime();
   if (curTime > this->lastControllerUpdateTime) {
     // gather robot state data
-    this->GetRobotStates(curTime);
-    // publish robot states
-    this->pubRobotStateQueue->push(this->robotState, this->pubRobotState);
+    this->PublishRobotState(curTime);
     if (this->publish_joint_state) this->PublishJointState();
 
     if (this->use_synchronized_command) {
@@ -697,104 +834,6 @@ bool IOBPlugin::serviceRefCallback(std_srvs::EmptyRequest &req,
   this->SetJointCommand_impl(jc);
 
   return true;
-}
-
-void IOBPlugin::GetRobotStates(const common::Time &_curTime){
-
-  // populate robotState from robot
-  this->robotState.header.stamp = ros::Time(_curTime.sec, _curTime.nsec);
-
-  // joint states
-  for (unsigned int i = 0; i < this->joints.size(); ++i) {
-    this->robotState.position[i] = this->joints[i]->GetAngle(0).Radian();
-    this->robotState.velocity[i] = this->joints[i]->GetVelocity(0);
-    if (this->use_joint_effort) {
-      physics::JointPtr j = this->joints[i];
-      physics::JointWrench w = j->GetForceTorque(0u);
-      {
-        math::Vector3 a = j->GetLocalAxis(0u);
-        this->robotState.effort[i] = a.Dot(w.body1Torque);
-      }
-#if 0 // DEBUG
-      {
-        math::Vector3 a = j->GetGlobalAxis(0u);
-        math::Vector3 m = this->joints[i]->GetChild()->GetWorldPose().rot * w.body2Torque;
-        float ret = this->robotState.effort[i] = a.Dot(m);
-        ROS_INFO("f[%d]->%f,%f", i, this->robotState.effort[i], ret);
-      }
-#endif
-    } else {
-      if (this->use_velocity_feedback) {
-        this->robotState.effort[i] = this->joints[i]->GetForce(0);
-      }
-    }
-  }
-
-  // force sensors
-  this->robotState.sensors.resize(this->forceSensorNames.size());
-  for (unsigned int i = 0; i < this->forceSensorNames.size(); i++) {
-    forceSensorMap::iterator it = this->forceSensors.find(this->forceSensorNames[i]);
-    if(it != this->forceSensors.end()) {
-      physics::JointPtr jt = it->second.joint;
-      if (!!jt) {
-        physics::JointWrench wrench = jt->GetForceTorque(0u);
-        this->robotState.sensors[i].name = this->forceSensorNames[i];
-        this->robotState.sensors[i].frame_id = it->second.frame_id;
-        if (!!it->second.pose) {
-          // convert force
-	  math::Vector3 force_trans = it->second.pose->rot * wrench.body2Force;
-	  math::Vector3 torque_trans = it->second.pose->rot * wrench.body2Torque;
-	  // rotate force
-	  this->robotState.sensors[i].force.x = force_trans.x;
-	  this->robotState.sensors[i].force.y = force_trans.y;
-	  this->robotState.sensors[i].force.z = force_trans.z;
-	  // rotate torque + additional torque
-	  torque_trans += it->second.pose->pos.Cross(force_trans);
-	  this->robotState.sensors[i].torque.x = torque_trans.x;
-	  this->robotState.sensors[i].torque.y = torque_trans.y;
-	  this->robotState.sensors[i].torque.z = torque_trans.z;
-	} else {
-	  this->robotState.sensors[i].force.x = wrench.body2Force.x;
-	  this->robotState.sensors[i].force.y = wrench.body2Force.y;
-	  this->robotState.sensors[i].force.z = wrench.body2Force.z;
-	  this->robotState.sensors[i].torque.x = wrench.body2Torque.x;
-	  this->robotState.sensors[i].torque.y = wrench.body2Torque.y;
-	  this->robotState.sensors[i].torque.z = wrench.body2Torque.z;
-        }
-      }
-    }
-  }
-
-  // imu sensors
-  this->robotState.Imus.resize(this->imuSensorNames.size());
-  for (unsigned int i = 0; i < this->imuSensorNames.size(); i++) {
-    imuSensorMap::iterator it = this->imuSensors.find(this->imuSensorNames[i]);
-    ImuSensorPtr sp = it->second.sensor;
-    if(!!sp) {
-      this->robotState.Imus[i].name = this->imuSensorNames[i];
-      this->robotState.Imus[i].frame_id = it->second.frame_id;
-      math::Vector3 wLocal = sp->GetAngularVelocity();
-      math::Vector3 accel = sp->GetLinearAcceleration();
-      math::Quaternion imuRot = sp->GetOrientation();
-      this->robotState.Imus[i].angular_velocity.x = wLocal.x;
-      this->robotState.Imus[i].angular_velocity.y = wLocal.y;
-      this->robotState.Imus[i].angular_velocity.z = wLocal.z;
-      this->robotState.Imus[i].linear_acceleration.x = accel.x;
-      this->robotState.Imus[i].linear_acceleration.y = accel.y;
-      this->robotState.Imus[i].linear_acceleration.z = accel.z;
-      this->robotState.Imus[i].orientation.x = imuRot.x;
-      this->robotState.Imus[i].orientation.y = imuRot.y;
-      this->robotState.Imus[i].orientation.z = imuRot.z;
-      this->robotState.Imus[i].orientation.w = imuRot.w;
-    }
-  }
-  {
-    boost::mutex::scoped_lock lock(this->mutex);
-    for (unsigned int i = 0; i < this->joints.size(); ++i) {
-      this->robotState.ref_position[i] = this->jointCommand.position[i];
-      this->robotState.ref_velocity[i] = this->jointCommand.velocity[i];
-    }
-  }
 }
 
 void IOBPlugin::UpdatePID_Velocity_Control(double _dt) {

@@ -61,7 +61,6 @@ namespace gazebo
     void RosQueueThread();
     void SrvQueueThread();
     void DeferredLoad();
-    void GetRobotStates(const common::Time &_curTime);
     void SetJointCommand(const JointCommand::ConstPtr &_msg);
     void SetJointCommand_impl(const JointCommand &_msg);
     void LoadPIDGainsFromParameter();
@@ -69,6 +68,10 @@ namespace gazebo
     void UpdatePIDControl(double _dt);
     void UpdatePID_Velocity_Control(double _dt);
     void PublishJointState();
+    void PublishRobotState(const common::Time &_curTime);
+    void GetForceSensors(double new_scale, double prv_scale);
+    void GetJointSensors();
+    void GetImuSensors();
 
     void GetIMUState(const common::Time &_curTime);
     void GetForceTorqueSensorState(const common::Time &_curTime);
@@ -108,6 +111,8 @@ namespace gazebo
     common::Time lastControllerUpdateTime;
 
     RobotState robotState;
+    int  publish_robot_state_step;
+    int  publish_robot_state_counter;
     ros::Publisher pubRobotState;
     PubQueue<RobotState>::Ptr pubRobotStateQueue;
 
