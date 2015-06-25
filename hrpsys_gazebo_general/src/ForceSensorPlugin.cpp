@@ -11,7 +11,8 @@ namespace gazebo
 {
   GZ_REGISTER_MODEL_PLUGIN(ForceSensorPlugin);
 
-  ForceSensorPlugin::ForceSensorPlugin() : force_sensor_average_window_size(5)
+  ForceSensorPlugin::ForceSensorPlugin() : force_sensor_average_window_size(5),
+					   force_sensor_average_cnt(0)
   {
   }
 
@@ -32,6 +33,8 @@ namespace gazebo
 	       this->robot_name.c_str(),
 	       _parent->GetScopedName().c_str());
     }
+    this->controller_name = this->robot_name + "/" + this->controller_name;
+    ROS_INFO("[ForceSensorPlugin] intialize with param: %s", this->controller_name.c_str());
 
     // ros node
     this->rosNode = new ros::NodeHandle("");
@@ -96,6 +99,18 @@ namespace gazebo
 	  } else {
 	    ROS_ERROR("Force-Torque sensor: %s has invalid configuration", sensor_name.c_str());
 	  }
+	  // setup force sensor publishers
+	  boost::shared_ptr<std::vector<boost::shared_ptr<geometry_msgs::WrenchStamped> > > forceValQueue(new std::vector<boost::shared_ptr<geometry_msgs::WrenchStamped> >);
+	  // forceValQueue->resize(this->force_sensor_average_window_size);
+	  for ( int i=0; i<this->force_sensor_average_window_size; i++ ){
+	    boost::shared_ptr<geometry_msgs::WrenchStamped> fbuf(new geometry_msgs::WrenchStamped);
+	    forceValQueue->push_back(fbuf);
+	  }
+	  this->forceValQueueMap[sensor_name] = forceValQueue;
+	  //
+	  this->pubForceValQueueMap[sensor_name] = this->pmq.addPub<geometry_msgs::WrenchStamped>();
+	  this->pubForceValMap[sensor_name] = this->rosNode->advertise<geometry_msgs::WrenchStamped>(this->robot_name + "/" + sensor_name, 100, true);
+	  ROS_INFO("[ForceSensorPlugin] advertise %s", this->pubForceValMap.find(sensor_name)->second.getTopic().c_str());
 	}
       } else {
 	ROS_WARN("Force-Torque sensor: no setting exists");
@@ -109,15 +124,97 @@ namespace gazebo
   void ForceSensorPlugin::DeferredLoad() {
     // publish multi queue
     this->pmq.startServiceThread();
-
     this->updateConnection =
       event::Events::ConnectWorldUpdateBegin(boost::bind(&ForceSensorPlugin::UpdateStates, this));
   }
 
   void ForceSensorPlugin::UpdateStates() {
-    //ROS_DEBUG("update");
     common::Time curTime = this->world->GetSimTime();
     if (curTime > this->lastControllerUpdateTime) {
+      // enqueue force sensor values
+      for (unsigned int i = 0; i < this->forceSensorNames.size(); i++) {
+	forceSensorMap::iterator it = this->forceSensors.find(this->forceSensorNames[i]);
+	boost::shared_ptr<std::vector<boost::shared_ptr<geometry_msgs::WrenchStamped> > > forceValQueue = this->forceValQueueMap.find(this->forceSensorNames[i])->second;
+	boost::shared_ptr<geometry_msgs::WrenchStamped> forceVal = forceValQueue->at(this->force_sensor_average_cnt);
+	geometry_msgs::WrenchStamped forceValMsg;
+	if(it != this->forceSensors.end()) {
+	  physics::JointPtr jt = it->second.joint;
+	  if (!!jt) {
+	    physics::JointWrench wrench = jt->GetForceTorque(0u);
+	    forceValMsg.header.frame_id = it->second.frame_id;
+	    if (!!it->second.pose) {
+	      // convert force
+	      math::Vector3 force_trans = it->second.pose->rot * wrench.body2Force;
+	      math::Vector3 torque_trans = it->second.pose->rot * wrench.body2Torque;
+	      // rotate force
+	      forceVal->wrench.force.x = force_trans.x;
+	      forceVal->wrench.force.y = force_trans.y;
+	      forceVal->wrench.force.z = force_trans.z;
+	      // rotate torque + additional torque
+	      torque_trans += it->second.pose->pos.Cross(force_trans);
+	      forceVal->wrench.torque.x = torque_trans.x;
+	      forceVal->wrench.torque.y = torque_trans.y;
+	      forceVal->wrench.torque.z = torque_trans.z;
+	    } else {
+	      forceVal->wrench.force.x = wrench.body2Force.x;
+	      forceVal->wrench.force.y = wrench.body2Force.y;
+	      forceVal->wrench.force.z = wrench.body2Force.z;
+	      forceVal->wrench.torque.x = wrench.body2Torque.x;
+	      forceVal->wrench.torque.y = wrench.body2Torque.y;
+	      forceVal->wrench.torque.z = wrench.body2Torque.z;
+	    }
+	  } else {
+	    ROS_WARN("[ForceSensorPlugin] joint not found for %s", this->forceSensorNames[i].c_str());
+	  }
+	}
+	// std::cout << "[ForceSensorPlugin] set " << this->force_sensor_average_cnt << "-th value (";
+	// std::cout << forceVal->wrench.force.x << ","
+	// 	  << forceVal->wrench.force.y << ","
+	// 	  << forceVal->wrench.force.z << ","
+	// 	  << forceVal->wrench.torque.x << ","
+	// 	  << forceVal->wrench.torque.y << ","
+	// 	  << forceVal->wrench.torque.z << ")" << std::endl;
+	// calc average force sensors
+	forceValMsg.wrench.force.x = 0;
+	forceValMsg.wrench.force.y = 0;
+	forceValMsg.wrench.force.z = 0;
+	forceValMsg.wrench.torque.x = 0;
+	forceValMsg.wrench.torque.y = 0;
+	forceValMsg.wrench.torque.z = 0;
+	for ( int j=0; j<forceValQueue->size() ; j++ ){
+	  boost::shared_ptr<geometry_msgs::WrenchStamped> forceValBuf = forceValQueue->at(j);
+	  forceValMsg.wrench.force.x += forceValBuf->wrench.force.x;
+	  forceValMsg.wrench.force.y += forceValBuf->wrench.force.y;
+	  forceValMsg.wrench.force.z += forceValBuf->wrench.force.z;
+	  forceValMsg.wrench.torque.x += forceValBuf->wrench.torque.x;
+	  forceValMsg.wrench.torque.y += forceValBuf->wrench.torque.y;
+	  forceValMsg.wrench.torque.z += forceValBuf->wrench.torque.z;
+	  //
+	  // std::cout << "[ForceSensorPlugin] get " << j << "-th value (";
+	  // std::cout << forceValBuf->wrench.force.x << ","
+	  // 	    << forceValBuf->wrench.force.y << ","
+	  // 	    << forceValBuf->wrench.force.z << ","
+	  // 	    << forceValBuf->wrench.torque.x << ","
+	  // 	    << forceValBuf->wrench.torque.y << ","
+	  // 	    << forceValBuf->wrench.torque.z << ")" << std::endl;
+	}
+	if ( forceValQueue->size() > 0 ){
+	  forceValMsg.wrench.force.x *= 1.0/forceValQueue->size();
+	  forceValMsg.wrench.force.y *= 1.0/forceValQueue->size();
+	  forceValMsg.wrench.force.z *= 1.0/forceValQueue->size();
+	  forceValMsg.wrench.torque.x *= 1.0/forceValQueue->size();
+	  forceValMsg.wrench.torque.y *= 1.0/forceValQueue->size();
+	  forceValMsg.wrench.torque.z *= 1.0/forceValQueue->size();
+	} else {
+	  ROS_WARN("[ForceSensorPlugin] invalid force val queue size 0");
+	}
+	// publish force sensor values
+	forceValMsg.header.stamp = ros::Time(curTime.sec, curTime.nsec);
+	PubQueue<geometry_msgs::WrenchStamped>::Ptr pubForceValQueue = this->pubForceValQueueMap.find(this->forceSensorNames[i])->second;
+	ros::Publisher pubForceVal = this->pubForceValMap.find(this->forceSensorNames[i])->second;
+	pubForceValQueue->push(forceValMsg, pubForceVal);
+      }
+      this->force_sensor_average_cnt = (this->force_sensor_average_cnt+1) % this->force_sensor_average_window_size;
     }
     this->lastControllerUpdateTime = curTime;
   }
