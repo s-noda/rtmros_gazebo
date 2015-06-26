@@ -69,6 +69,7 @@ namespace gazebo
     void UpdatePIDControl(double _dt);
     void UpdatePID_Velocity_Control(double _dt);
     void PublishJointState();
+    void SetForceValue(std::string sensor_name, int sensor_id, const geometry_msgs::WrenchStamped::ConstPtr &_msg);
 
     void GetIMUState(const common::Time &_curTime);
     void GetForceTorqueSensorState(const common::Time &_curTime);
@@ -78,11 +79,11 @@ namespace gazebo
     bool serviceRefCallback(std_srvs::EmptyRequest &req,
                             std_srvs::EmptyResponse &res);
 
-    struct force_sensor_info {
-      physics::JointPtr joint;
-      std::string frame_id;
-      PosePtr pose;
-    };
+    /* struct force_sensor_info { */
+    /*   physics::JointPtr joint; */
+    /*   std::string frame_id; */
+    /*   PosePtr pose; */
+    /* }; */
 
     struct imu_sensor_info {
       physics::LinkPtr link;
@@ -123,6 +124,8 @@ namespace gazebo
     JointCommand jointCommand;
     ros::Subscriber subIOBCommand;
 
+    std::vector<ros::Subscriber> forceSensorSubVector;
+
     std::vector<std::string> jointNames;
     physics::Joint_V joints;
 
@@ -131,11 +134,11 @@ namespace gazebo
     std::vector<double> jointDampingMax;
     std::vector<double> jointDampingMin;
 
-    typedef std::map< std::string, struct force_sensor_info > forceSensorMap;
+    // typedef std::map< std::string, struct force_sensor_info > forceSensorMap;
     typedef std::map< std::string, struct imu_sensor_info > imuSensorMap;
     std::vector<std::string> forceSensorNames;
     std::vector<std::string> imuSensorNames;
-    forceSensorMap forceSensors;
+    // forceSensorMap forceSensors;
     imuSensorMap imuSensors;
 
     std::vector<double> effortLimit;
