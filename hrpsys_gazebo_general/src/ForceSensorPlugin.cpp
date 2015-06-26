@@ -34,6 +34,11 @@ namespace gazebo
 	       _parent->GetScopedName().c_str());
     }
     this->controller_name = this->robot_name + "/" + this->controller_name;
+
+    if (_sdf->HasElement("force_sensor_average_window_size")) {
+      this->force_sensor_average_window_size = _sdf->Get<float>("force_sensor_average_window_size");
+    }
+
     ROS_INFO("[ForceSensorPlugin] intialize with param: %s", this->controller_name.c_str());
 
     // ros node
